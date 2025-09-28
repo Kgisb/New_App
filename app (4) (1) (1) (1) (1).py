@@ -3263,7 +3263,7 @@ elif view == "Dashboard":
         enrol_mask_by_pay  = _between(p_dt, start_d, end_d)  # payment happened within window
 
         if mode == "Cohort":
-            # Cohort (your meaning): outputs are within [start_d, end_d]; Create Date can be anything.
+            # Cohort (your meaning): outputs within [start_d, end_d]; Create Date can be anything.
             # - Deals Created: creations in window
             # - Enrolments: payments in window (no restriction on Create Date)
             # - Referral Deals Created: creations in window with Source=Referral
