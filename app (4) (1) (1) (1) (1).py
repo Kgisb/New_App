@@ -3132,3 +3132,182 @@ elif view == "AC Wise Detail":
                 mime="text/csv",
                 key="ac_stack_dl_conv"
             )
+elif view == "Dashboard":
+    st.subheader("Dashboard — Business Snapshot")
+
+    # =========================
+    # Safe base dataframe pick
+    # =========================
+    try:
+        base = df_f.copy()
+    except NameError:
+        base = df.copy()
+
+    # =========================
+    # Small helpers (local)
+    # =========================
+    def _get_col(dframe, candidates):
+        """
+        Return the first existing column from candidates.
+        - Tries exact, stripped, and case-insensitive matches.
+        """
+        cols = list(dframe.columns)
+        strip_map = {c: c.strip() for c in cols}
+        # 1) exact
+        for c in candidates:
+            if c in cols:
+                return c
+        # 2) strip-compare
+        for c in candidates:
+            for orig, stripped in strip_map.items():
+                if stripped == c:
+                    return orig
+        # 3) case-insensitive strip
+        low_map = {c.lower().strip(): c for c in cols}
+        for c in candidates:
+            key = c.lower().strip()
+            if key in low_map:
+                return low_map[key]
+        return None
+
+    def _to_dt(series):
+        """Coerce to pandas datetime (errors->NaT)."""
+        return pd.to_datetime(series, errors="coerce")
+
+    # Column resolution (keeps your quirks like trailing spaces safe)
+    CREATE_COL  = _get_col(base, ["Create Date"])
+    PAY_COL     = _get_col(base, ["Payment Received Date", "Payment Received Date "])  # note trailing space variant
+    SRC_COL     = _get_col(base, ["JetLearn Deal Source", "_src_raw"])  # support normalized column if you have it
+    REF_INTENT  = _get_col(base, ["Referral Intent Source"])
+
+    # Guard rails — show a warning if any key column is missing
+    missing = [label for label, col in [
+        ("Create Date", CREATE_COL),
+        ("Payment Received Date", PAY_COL),
+        ("JetLearn Deal Source", SRC_COL),
+        ("Referral Intent Source", REF_INTENT),
+    ] if col is None]
+    if missing:
+        st.warning("Missing columns: " + ", ".join(missing) + ". Some dashboard metrics may be zero.", icon="⚠️")
+
+    # Parse dates (NaT-safe)
+    c_dt = _to_dt(base[CREATE_COL]) if CREATE_COL else pd.Series(pd.NaT, index=base.index)
+    p_dt = _to_dt(base[PAY_COL])    if PAY_COL   else pd.Series(pd.NaT, index=base.index)
+
+    # Normalize source / intent strings
+    def _norm_str(s):
+        return s.fillna("").astype(str).str.strip()
+
+    src  = _norm_str(base[SRC_COL]) if SRC_COL else pd.Series("", index=base.index)
+    rint = _norm_str(base[REF_INTENT]) if REF_INTENT else pd.Series("", index=base.index)
+
+    # Referral matchers
+    is_referral = src.str.lower().eq("referral")
+    is_sales_generated = rint.str.lower().eq("sales generated")
+
+    # =========================
+    # Time windows (India TZ)
+    # =========================
+    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    yesterday = (pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(days=1)).date()
+
+    # Current month
+    cm_start = today.replace(day=1)
+    cm_end = today  # inclusive up to today
+
+    # Last month
+    cm_start_ts = pd.Timestamp(cm_start)
+    lm_end = (cm_start_ts - pd.Timedelta(days=1)).date()
+    lm_start = lm_end.replace(day=1)
+
+    # Helper for date-between on .dt.date
+    def _between(series_dt, start_d, end_d):
+        s_date = series_dt.dt.date
+        return s_date.between(start_d, end_d, inclusive="both")
+
+    # =========================
+    # Mode toggle
+    # =========================
+    mode = st.radio(
+        "Counting mode",
+        ["MTD", "Cohort"],
+        index=1,  # default to Cohort
+        horizontal=True,
+        help=(
+            "MTD: Each metric uses its own event date within the period.\n"
+            "Cohort: First select deals created in the period; all metrics are computed within that cohort, "
+            "and payments are also required to fall inside the same period."
+        ),
+    )
+
+    # =========================
+    # Metric computer
+    # =========================
+    def compute_metrics(start_d, end_d, label):
+        if mode == "MTD":
+            # Independent by event date
+            deals_created_mask = _between(c_dt, start_d, end_d)
+            enrol_mask = _between(p_dt, start_d, end_d)
+
+            referral_deals_mask = deals_created_mask & is_referral
+            referral_sales_mask = referral_deals_mask & is_sales_generated
+
+            return {
+                "Deals Created": int(deals_created_mask.sum()),
+                "Enrolments": int(enrol_mask.sum()),
+                "Referral Deals Created": int(referral_deals_mask.sum()),
+                "Referral – Sales Generated": int(referral_sales_mask.sum()),
+            }
+
+        else:  # Cohort
+            # Cohort = deals created in range
+            cohort_mask = _between(c_dt, start_d, end_d)
+
+            # Within cohort:
+            enrol_mask = cohort_mask & _between(p_dt, start_d, end_d)
+            ref_mask = cohort_mask & is_referral
+            ref_sales_mask = ref_mask & is_sales_generated
+
+            return {
+                "Deals Created": int(cohort_mask.sum()),
+                "Enrolments": int(enrol_mask.sum()),
+                "Referral Deals Created": int(ref_mask.sum()),
+                "Referral – Sales Generated": int(ref_sales_mask.sum()),
+            }
+
+    # =========================
+    # Render four KPI boxes
+    # =========================
+    PERIODS = [
+        ("Yesterday", yesterday, yesterday),
+        ("Today", today, today),
+        ("Last Month", lm_start, lm_end),
+        ("This Month", cm_start, cm_end),
+    ]
+
+    c1, c2, c3, c4 = st.columns(4)
+    cols = [c1, c2, c3, c4]
+
+    for (title, start_d, end_d), col in zip(PERIODS, cols):
+        mets = compute_metrics(start_d, end_d, title)
+        with col:
+            st.markdown(f"### {title}")
+            st.markdown(
+                f"""
+                <div style="border:1px solid #e5e7eb; border-radius:14px; padding:10px; background:#ffffff;">
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span><strong>Deals Created</strong></span><span>{mets['Deals Created']}</span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span><strong>Enrolments</strong></span><span>{mets['Enrolments']}</span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span><strong>Referral Deals Created</strong></span><span>{mets['Referral Deals Created']}</span>
+                  </div>
+                  <div style="display:flex; justify-content:space-between;">
+                    <span><strong>Referral – Sales Generated</strong></span><span>{mets['Referral – Sales Generated']}</span>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
