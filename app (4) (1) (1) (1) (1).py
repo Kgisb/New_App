@@ -3181,7 +3181,7 @@ elif view == "Dashboard":
     def _month_bounds(any_date):
         """Return first_day, last_day for the calendar month of a date."""
         first = any_date.replace(day=1)
-        # next month
+        # next month begin
         next_month = (pd.Timestamp(first) + pd.offsets.MonthBegin(1)).date()
         last = (pd.Timestamp(next_month) - pd.Timedelta(days=1)).date()
         return first, last
@@ -3191,7 +3191,7 @@ elif view == "Dashboard":
     # =========================
     CREATE_COL  = _get_col(base, ["Create Date"])
     PAY_COL     = _get_col(base, ["Payment Received Date", "Payment Received Date "])  # trailing space variant
-    SRC_COL     = _get_col(base, ["JetLearn Deal Source", "_src_raw"])  # support normalized source if present
+    SRC_COL     = _get_col(base, ["JetLearn Deal Source", "_src_raw"])
     REF_INTENT  = _get_col(base, ["Referral Intent Source"])
 
     # Guard rails — warn if missing
@@ -3210,22 +3210,17 @@ elif view == "Dashboard":
     # =========================
     # Parse dates & normalize text
     # =========================
-    if CREATE_COL:
-        c_dt = _to_dt(base[CREATE_COL])
-    else:
-        c_dt = pd.Series(pd.NaT, index=base.index)
+    c_dt = _to_dt(base[CREATE_COL]) if CREATE_COL else pd.Series(pd.NaT, index=base.index)
+    p_dt = _to_dt(base[PAY_COL])    if PAY_COL   else pd.Series(pd.NaT, index=base.index)
 
-    if PAY_COL:
-        p_dt = _to_dt(base[PAY_COL])
-    else:
-        p_dt = pd.Series(pd.NaT, index=base.index)
+    src  = _norm_str(base[SRC_COL])     if SRC_COL    else pd.Series("", index=base.index)
+    rint = _norm_str(base[REF_INTENT])  if REF_INTENT else pd.Series("", index=base.index)
 
-    src  = _norm_str(base[SRC_COL]) if SRC_COL else pd.Series("", index=base.index)
-    rint = _norm_str(base[REF_INTENT]) if REF_INTENT else pd.Series("", index=base.index)
-
-    # Referral matchers
-    is_referral = src.str.lower().eq("referral")
-    is_sales_generated = rint.str.lower().eq("sales generated")
+    # Referral / Intent matchers (based on your sheet values)
+    # - Source uses "Referrals" (plural). Be robust: any text containing "referr".
+    is_referral = src.str.contains("referr", case=False, na=False)
+    # - Intent should include "Sales Generated" variants (e.g., "Gift Card - Sales Generated")
+    is_sales_generated = rint.str.contains(r"Sales Generated", case=False, na=False)
 
     # =========================
     # Time windows (Asia/Kolkata)
@@ -3238,7 +3233,7 @@ elif view == "Dashboard":
     cm_start = today.replace(day=1)
     cm_end = today  # inclusive up to today
 
-    # Last month window
+    # Last month window (full calendar month)
     lm_start_tmp, lm_end_tmp = _month_bounds((pd.Timestamp(cm_start) - pd.Timedelta(days=1)).date())
     lm_start, lm_end = lm_start_tmp, lm_end_tmp
 
@@ -3269,20 +3264,19 @@ elif view == "Dashboard":
         window_* : the visible KPI window (e.g., Yesterday, Today, Last Month, This Month)
         active_month_* : the full calendar month corresponding to the window (for MTD enrolment restriction)
         """
-        # Base masks by event date (independent)
-        deals_created_mask = _between(c_dt, window_start, window_end)   # creations in window
-        payments_in_window = _between(p_dt, window_start, window_end)   # payments in window
-
-        # Created-based metrics (same in both modes)
+        # Created-based masks (by Create Date in the window)
+        deals_created_mask = _between(c_dt, window_start, window_end)
         referral_created_mask = deals_created_mask & is_referral
         referral_sales_from_created = referral_created_mask & is_sales_generated
 
-        # Enrolments differ by mode
+        # Payments in window (by Payment Received Date)
+        payments_in_window = _between(p_dt, window_start, window_end)
+
+        # Enrolments logic
         if mode == "Cohort":
             enrol_count = int(payments_in_window.sum())  # payment-by-date only
         else:
-            # MTD: restrict enrolments to deals created in active month (full calendar month),
-            # AND payment must be within the window.
+            # MTD: restrict enrolments to deals created in the active calendar month
             created_in_active_month = _between(c_dt, active_month_start, active_month_end)
             enrol_count = int((payments_in_window & created_in_active_month).sum())
 
