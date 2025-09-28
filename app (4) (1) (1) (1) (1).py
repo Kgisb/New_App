@@ -3178,6 +3178,14 @@ elif view == "Dashboard":
         """Normalize string series safely."""
         return s.fillna("").astype(str).str.strip()
 
+    def _month_bounds(any_date):
+        """Return first_day, last_day for the calendar month of a date."""
+        first = any_date.replace(day=1)
+        # next month
+        next_month = (pd.Timestamp(first) + pd.offsets.MonthBegin(1)).date()
+        last = (pd.Timestamp(next_month) - pd.Timedelta(days=1)).date()
+        return first, last
+
     # =========================
     # Column resolution
     # =========================
@@ -3226,14 +3234,13 @@ elif view == "Dashboard":
     today = now_ist.date()
     yesterday = (now_ist - pd.Timedelta(days=1)).date()
 
-    # Current month
+    # Current month (window for "This Month")
     cm_start = today.replace(day=1)
-    cm_end = today  # inclusive
+    cm_end = today  # inclusive up to today
 
-    # Last month
-    cm_start_ts = pd.Timestamp(cm_start)
-    lm_end = (cm_start_ts - pd.Timedelta(days=1)).date()
-    lm_start = lm_end.replace(day=1)
+    # Last month window
+    lm_start_tmp, lm_end_tmp = _month_bounds((pd.Timestamp(cm_start) - pd.Timedelta(days=1)).date())
+    lm_start, lm_end = lm_start_tmp, lm_end_tmp
 
     # Date-between helper over .dt.date
     def _between(series_dt, start_d, end_d):
@@ -3245,68 +3252,75 @@ elif view == "Dashboard":
     # =========================
     mode = st.radio(
         "Counting mode",
-        ["Cohort", "MTD"],   # Cohort default: outputs in period; Create Date can be anything
+        ["Cohort", "MTD"],   # Cohort default
         index=0,
         horizontal=True,
         help=(
             "Cohort: Outputs in the selected period; deal Create Date can be anything.\n"
-            "MTD: Limit to deals CREATED in the period, and count outputs in the period only for those deals."
+            "MTD: Enrolments only count if the deal was CREATED in the active calendar month of that period."
         ),
     )
 
     # =========================
-    # Metric computer (Cohort vs MTD)
+    # Metric computer
     # =========================
-    def compute_metrics(start_d, end_d):
-        # Masks by event date (independent of mode)
-        deals_created_mask = _between(c_dt, start_d, end_d)  # creation happened within window
-        enrol_mask_by_pay  = _between(p_dt, start_d, end_d)  # payment happened within window
+    def compute_metrics(window_start, window_end, active_month_start, active_month_end):
+        """
+        window_* : the visible KPI window (e.g., Yesterday, Today, Last Month, This Month)
+        active_month_* : the full calendar month corresponding to the window (for MTD enrolment restriction)
+        """
+        # Base masks by event date (independent)
+        deals_created_mask = _between(c_dt, window_start, window_end)   # creations in window
+        payments_in_window = _between(p_dt, window_start, window_end)   # payments in window
 
+        # Created-based metrics (same in both modes)
+        referral_created_mask = deals_created_mask & is_referral
+        referral_sales_from_created = referral_created_mask & is_sales_generated
+
+        # Enrolments differ by mode
         if mode == "Cohort":
-            # Cohort (your meaning): outputs within [start_d, end_d]; Create Date can be anything.
-            # - Deals Created: creations in window
-            # - Enrolments: payments in window (no restriction on Create Date)
-            # - Referral Deals Created: creations in window with Source=Referral
-            # - Referral – Sales Generated: "out of that" referral-created set with intent=Sales Generated
-            referral_deals_mask = deals_created_mask & is_referral
-            referral_sales_mask = referral_deals_mask & is_sales_generated
-
-            return {
-                "Deals Created": int(deals_created_mask.sum()),
-                "Enrolments": int(enrol_mask_by_pay.sum()),
-                "Referral Deals Created": int(referral_deals_mask.sum()),
-                "Referral – Sales Generated": int(referral_sales_mask.sum()),
-            }
-
+            enrol_count = int(payments_in_window.sum())  # payment-by-date only
         else:
-            # MTD: true create-date cohort — only deals created within window are considered for all metrics
-            cohort_mask = deals_created_mask
-            enrol_mask  = cohort_mask & enrol_mask_by_pay
-            ref_mask    = cohort_mask & is_referral
-            ref_sales   = ref_mask & is_sales_generated
+            # MTD: restrict enrolments to deals created in active month (full calendar month),
+            # AND payment must be within the window.
+            created_in_active_month = _between(c_dt, active_month_start, active_month_end)
+            enrol_count = int((payments_in_window & created_in_active_month).sum())
 
-            return {
-                "Deals Created": int(cohort_mask.sum()),
-                "Enrolments": int(enrol_mask.sum()),
-                "Referral Deals Created": int(ref_mask.sum()),
-                "Referral – Sales Generated": int(ref_sales.sum()),
-            }
+        return {
+            "Deals Created": int(deals_created_mask.sum()),
+            "Enrolments": enrol_count,
+            "Referral Deals Created": int(referral_created_mask.sum()),
+            "Referral – Sales Generated": int(referral_sales_from_created.sum()),
+        }
+
+    # =========================
+    # Define periods & their active months
+    # =========================
+    # Yesterday
+    y_m_start, y_m_end = _month_bounds(yesterday)
+    # Today
+    t_m_start, t_m_end = _month_bounds(today)
+    # Last Month (active month is the last calendar month)
+    lm_m_start, lm_m_end = lm_start, lm_end
+    # This Month (active month is the current calendar month)
+    tm_m_start, tm_m_end = _month_bounds(today)
+
+    PERIODS = [
+        # label, window_start, window_end, active_month_start, active_month_end
+        ("Yesterday", yesterday, yesterday, y_m_start, y_m_end),
+        ("Today", today, today, t_m_start, t_m_end),
+        ("Last Month", lm_start, lm_end, lm_m_start, lm_m_end),
+        ("This Month", cm_start, cm_end, tm_m_start, tm_m_end),
+    ]
 
     # =========================
     # Render four KPI boxes
     # =========================
-    PERIODS = [
-        ("Yesterday", yesterday, yesterday),
-        ("Today", today, today),
-        ("Last Month", lm_start, lm_end),
-        ("This Month", cm_start, cm_end),
-    ]
-
     c1, c2, c3, c4 = st.columns(4)
     cols = [c1, c2, c3, c4]
 
-    for (title, start_d, end_d), col in zip(PERIODS, cols):
-        mets = compute_metrics(start_d, end_d)
+    for (title, w_start, w_end, m_start, m_end), col in zip(PERIODS, cols):
+        mets = compute_metrics(w_start, w_end, m_start, m_end)
         with col:
             st.markdown(f"### {title}")
             st.markdown(
