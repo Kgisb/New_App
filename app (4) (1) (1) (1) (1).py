@@ -3144,25 +3144,25 @@ elif view == "Dashboard":
         base = df.copy()
 
     # =========================
-    # Small helpers (local)
+    # Local helpers (self-contained)
     # =========================
     def _get_col(dframe, candidates):
         """
         Return the first existing column from candidates.
-        - Tries exact, stripped, and case-insensitive matches.
+        Tries exact, stripped, and case-insensitive matches.
         """
         cols = list(dframe.columns)
-        strip_map = {c: c.strip() for c in cols}
-        # 1) exact
+        # exact
         for c in candidates:
             if c in cols:
                 return c
-        # 2) strip-compare
+        # strip compare
+        strip_map = {c: c.strip() for c in cols}
         for c in candidates:
             for orig, stripped in strip_map.items():
                 if stripped == c:
                     return orig
-        # 3) case-insensitive strip
+        # case-insensitive strip
         low_map = {c.lower().strip(): c for c in cols}
         for c in candidates:
             key = c.lower().strip()
@@ -3174,13 +3174,19 @@ elif view == "Dashboard":
         """Coerce to pandas datetime (errors->NaT)."""
         return pd.to_datetime(series, errors="coerce")
 
-    # Column resolution (keeps your quirks like trailing spaces safe)
+    def _norm_str(s):
+        """Normalize string series safely."""
+        return s.fillna("").astype(str).str.strip()
+
+    # =========================
+    # Column resolution
+    # =========================
     CREATE_COL  = _get_col(base, ["Create Date"])
-    PAY_COL     = _get_col(base, ["Payment Received Date", "Payment Received Date "])  # note trailing space variant
-    SRC_COL     = _get_col(base, ["JetLearn Deal Source", "_src_raw"])  # support normalized column if you have it
+    PAY_COL     = _get_col(base, ["Payment Received Date", "Payment Received Date "])  # trailing space variant
+    SRC_COL     = _get_col(base, ["JetLearn Deal Source", "_src_raw"])  # support normalized source if present
     REF_INTENT  = _get_col(base, ["Referral Intent Source"])
 
-    # Guard rails — show a warning if any key column is missing
+    # Guard rails — warn if missing
     missing = [label for label, col in [
         ("Create Date", CREATE_COL),
         ("Payment Received Date", PAY_COL),
@@ -3188,15 +3194,23 @@ elif view == "Dashboard":
         ("Referral Intent Source", REF_INTENT),
     ] if col is None]
     if missing:
-        st.warning("Missing columns: " + ", ".join(missing) + ". Some dashboard metrics may be zero.", icon="⚠️")
+        st.warning(
+            "Missing columns: " + ", ".join(missing) + ". Some dashboard metrics may be zero.",
+            icon="⚠️"
+        )
 
-    # Parse dates (NaT-safe)
-    c_dt = _to_dt(base[CREATE_COL]) if CREATE_COL else pd.Series(pd.NaT, index=base.index)
-    p_dt = _to_dt(base[PAY_COL])    if PAY_COL   else pd.Series(pd.NaT, index=base.index)
+    # =========================
+    # Parse dates & normalize text
+    # =========================
+    if CREATE_COL:
+        c_dt = _to_dt(base[CREATE_COL])
+    else:
+        c_dt = pd.Series(pd.NaT, index=base.index)
 
-    # Normalize source / intent strings
-    def _norm_str(s):
-        return s.fillna("").astype(str).str.strip()
+    if PAY_COL:
+        p_dt = _to_dt(base[PAY_COL])
+    else:
+        p_dt = pd.Series(pd.NaT, index=base.index)
 
     src  = _norm_str(base[SRC_COL]) if SRC_COL else pd.Series("", index=base.index)
     rint = _norm_str(base[REF_INTENT]) if REF_INTENT else pd.Series("", index=base.index)
@@ -3206,73 +3220,76 @@ elif view == "Dashboard":
     is_sales_generated = rint.str.lower().eq("sales generated")
 
     # =========================
-    # Time windows (India TZ)
+    # Time windows (Asia/Kolkata)
     # =========================
-    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-    yesterday = (pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(days=1)).date()
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    today = now_ist.date()
+    yesterday = (now_ist - pd.Timedelta(days=1)).date()
 
     # Current month
     cm_start = today.replace(day=1)
-    cm_end = today  # inclusive up to today
+    cm_end = today  # inclusive
 
     # Last month
     cm_start_ts = pd.Timestamp(cm_start)
     lm_end = (cm_start_ts - pd.Timedelta(days=1)).date()
     lm_start = lm_end.replace(day=1)
 
-    # Helper for date-between on .dt.date
+    # Date-between helper over .dt.date
     def _between(series_dt, start_d, end_d):
         s_date = series_dt.dt.date
         return s_date.between(start_d, end_d, inclusive="both")
 
     # =========================
-    # Mode toggle
+    # Mode toggle (per your definition)
     # =========================
     mode = st.radio(
         "Counting mode",
-        ["MTD", "Cohort"],
-        index=1,  # default to Cohort
+        ["Cohort", "MTD"],   # Cohort default: outputs in period; Create Date can be anything
+        index=0,
         horizontal=True,
         help=(
-            "MTD: Each metric uses its own event date within the period.\n"
-            "Cohort: First select deals created in the period; all metrics are computed within that cohort, "
-            "and payments are also required to fall inside the same period."
+            "Cohort: Outputs in the selected period; deal Create Date can be anything.\n"
+            "MTD: Limit to deals CREATED in the period, and count outputs in the period only for those deals."
         ),
     )
 
     # =========================
-    # Metric computer
+    # Metric computer (Cohort vs MTD)
     # =========================
-    def compute_metrics(start_d, end_d, label):
-        if mode == "MTD":
-            # Independent by event date
-            deals_created_mask = _between(c_dt, start_d, end_d)
-            enrol_mask = _between(p_dt, start_d, end_d)
+    def compute_metrics(start_d, end_d):
+        # Masks by event date (independent of mode)
+        deals_created_mask = _between(c_dt, start_d, end_d)  # creation happened within window
+        enrol_mask_by_pay  = _between(p_dt, start_d, end_d)  # payment happened within window
 
+        if mode == "Cohort":
+            # Cohort (your meaning): outputs are within [start_d, end_d]; Create Date can be anything.
+            # - Deals Created: creations in window
+            # - Enrolments: payments in window (no restriction on Create Date)
+            # - Referral Deals Created: creations in window with Source=Referral
+            # - Referral – Sales Generated: "out of that" referral-created set with intent=Sales Generated
             referral_deals_mask = deals_created_mask & is_referral
             referral_sales_mask = referral_deals_mask & is_sales_generated
 
             return {
                 "Deals Created": int(deals_created_mask.sum()),
-                "Enrolments": int(enrol_mask.sum()),
+                "Enrolments": int(enrol_mask_by_pay.sum()),
                 "Referral Deals Created": int(referral_deals_mask.sum()),
                 "Referral – Sales Generated": int(referral_sales_mask.sum()),
             }
 
-        else:  # Cohort
-            # Cohort = deals created in range
-            cohort_mask = _between(c_dt, start_d, end_d)
-
-            # Within cohort:
-            enrol_mask = cohort_mask & _between(p_dt, start_d, end_d)
-            ref_mask = cohort_mask & is_referral
-            ref_sales_mask = ref_mask & is_sales_generated
+        else:
+            # MTD: true create-date cohort — only deals created within window are considered for all metrics
+            cohort_mask = deals_created_mask
+            enrol_mask  = cohort_mask & enrol_mask_by_pay
+            ref_mask    = cohort_mask & is_referral
+            ref_sales   = ref_mask & is_sales_generated
 
             return {
                 "Deals Created": int(cohort_mask.sum()),
                 "Enrolments": int(enrol_mask.sum()),
                 "Referral Deals Created": int(ref_mask.sum()),
-                "Referral – Sales Generated": int(ref_sales_mask.sum()),
+                "Referral – Sales Generated": int(ref_sales.sum()),
             }
 
     # =========================
@@ -3289,7 +3306,7 @@ elif view == "Dashboard":
     cols = [c1, c2, c3, c4]
 
     for (title, start_d, end_d), col in zip(PERIODS, cols):
-        mets = compute_metrics(start_d, end_d, title)
+        mets = compute_metrics(start_d, end_d)
         with col:
             st.markdown(f"### {title}")
             st.markdown(
